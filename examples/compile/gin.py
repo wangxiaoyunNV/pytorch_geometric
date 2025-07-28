@@ -68,12 +68,13 @@ def train():
     total_loss = 0
     for data in train_loader:
         data = data.to(device)
+        print (data.x.shape, data.edge_index.shape, data.batch.shape, data.batch_size)
         optimizer.zero_grad()
         out = model(data.x, data.edge_index, data.batch, data.batch_size)
         loss = F.cross_entropy(out, data.y)
         loss.backward()
         optimizer.step()
-        total_loss += float(loss) * data.num_graphs
+        total_loss += float(loss.detach()) * data.num_graphs
     return total_loss / len(train_loader.dataset)
 
 
@@ -91,7 +92,7 @@ def test(loader):
 
 
 times = []
-for epoch in range(1, 101):
+for epoch in range(1, 10):
     start = time.time()
     loss = train()
     train_acc = test(train_loader)
