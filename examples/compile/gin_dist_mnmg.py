@@ -1,7 +1,11 @@
 import time
 import argparse
+import os
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from torch_geometric.nn import MLP, GINConv, global_add_pool
 from torch_geometric.data import Batch
@@ -67,12 +71,33 @@ class DistTensorGraphDataset(Dataset):
                    edge_index=local_sub_edge_index.t(),  # Transpose to [2, num_edges] format
                    y=self.feature_store["graph", "y", None][actual_graph_idx_gpu])
 
-def setup_distributed():
+def setup_distributed(rank, world_size, master_addr='localhost', master_port='12355', num_nodes=1, node_rank=0):
+    """Setup distributed training environment for given rank and world_size"""
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = master_port
+    
+    # Calculate global rank and local rank for multi-node setup
+    local_world_size = world_size // num_nodes
+    global_rank = node_rank * local_world_size + rank
+    local_rank = rank
+    
+    # Set environment variables required by cugraph-pyg FeatureStore
+    os.environ['RANK'] = str(global_rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(local_rank)
+    os.environ['LOCAL_WORLD_SIZE'] = str(local_world_size)
+    
     if not dist.is_initialized():
         dist.init_process_group(
-            backend="nccl",  # or "gloo" for CPU-only, but "nccl" is recommended for GPU
+            backend="nccl",  # NCCL backend for GPU communication
+            rank=global_rank,
+            world_size=world_size,
             init_method="env://"
         )
+    
+    # Set the current device for this process
+    torch.cuda.set_device(local_rank)
+    print(f"Node {node_rank}, Local Rank {local_rank}, Global Rank {global_rank}/{world_size} initialized on device cuda:{local_rank}")
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -80,9 +105,14 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dataset", type=str, default="MUTAG")
     parser.add_argument("--data_root", type=str, default="../../data/TU")
+    # Distributed training arguments
+    parser.add_argument("--master_addr", type=str, default="localhost")
+    parser.add_argument("--master_port", type=str, default="12355")
+    parser.add_argument("--world_size", type=int, default=None, help="Total number of processes (auto-detected if None)")
+    parser.add_argument("--num_nodes", type=int, default=1, help="Number of nodes")
+    parser.add_argument("--node_rank", type=int, default=0, help="Rank of this node")
     return parser.parse_args()
 
 class GIN(torch.nn.Module):
@@ -136,10 +166,16 @@ def load_data(dataset_name, dataset_root, device, device_id):
     num_classes = int(data.y.max().item()) + 1
     return (feature_store, dist_edge_index), split_idx, num_features, num_classes
 
-def train(model, loader, optimizer, device):
+def train(model, loader, optimizer, device, local_rank, global_rank):
     model.train()
     total_loss = 0
-    for batch in loader:
+    total_samples = 0
+    
+    # Only local rank 0 on each node prints to avoid too much output
+    if local_rank == 0:
+        print(f"Node local rank {local_rank} (global rank {global_rank}): Starting training with {len(loader)} batches")
+    
+    for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
         x = batch.x
         edge_index = batch.edge_index
@@ -150,13 +186,33 @@ def train(model, loader, optimizer, device):
         loss.backward()
         optimizer.step()
         total_loss += float(loss.detach()) * batch.num_graphs
-    return total_loss / len(loader.dataset)
+        total_samples += batch.num_graphs
+        
+        # Optional: Detailed logging from local rank 0 only (one per node)
+        if local_rank == 0 and batch_idx % 10 == 0:
+            print(f"Local rank {local_rank} (global rank {global_rank}): Batch {batch_idx}, Loss: {loss.item():.4f}")
+    
+    # Average loss across all ranks
+    total_loss_tensor = torch.tensor(total_loss, device=device)
+    total_samples_tensor = torch.tensor(total_samples, device=device)
+    
+    dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
+    
+    if local_rank == 0:
+        print(f"Local rank {local_rank} (global rank {global_rank}): Training completed. Global avg loss: {total_loss_tensor.item() / total_samples_tensor.item():.4f}")
+    
+    return total_loss_tensor.item() / total_samples_tensor.item()
 
 @torch.no_grad()
-def test(model, loader, device):
+def test(model, loader, device, local_rank, global_rank):
     model.eval()
     total_correct = total_examples = 0
-    for batch in loader:
+    
+    if local_rank == 0:
+        print(f"Local rank {local_rank} (global rank {global_rank}): Starting evaluation with {len(loader)} batches")
+    
+    for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
         x = batch.x
         edge_index = batch.edge_index
@@ -165,22 +221,41 @@ def test(model, loader, device):
         pred = out.argmax(dim=-1)
         total_correct += int((pred == y).sum())
         total_examples += y.size(0)
-    return total_correct / total_examples if total_examples > 0 else 0.0
+        
+        # Optional: Progress logging from local rank 0 only
+        if local_rank == 0 and batch_idx % 5 == 0:
+            local_acc = total_correct / total_examples if total_examples > 0 else 0
+            print(f"Local rank {local_rank} (global rank {global_rank}): Eval batch {batch_idx}, Local accuracy so far: {local_acc:.4f}")
+    
+    # Aggregate results across all ranks
+    total_correct_tensor = torch.tensor(total_correct, device=device)
+    total_examples_tensor = torch.tensor(total_examples, device=device)
+    
+    dist.all_reduce(total_correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_examples_tensor, op=dist.ReduceOp.SUM)
+    
+    global_accuracy = total_correct_tensor.item() / total_examples_tensor.item() if total_examples_tensor.item() > 0 else 0.0
+    
+    if local_rank == 0:
+        print(f"Local rank {local_rank} (global rank {global_rank}): Evaluation completed. Global accuracy: {global_accuracy:.4f}")
+    
+    return global_accuracy
 
-def main():
-    setup_distributed()
-    args = parse_args()
-    if args.device.startswith("cuda") and ":" in args.device:
-        device = torch.device(args.device)
-        device_id = device.index
-    elif args.device.startswith("cuda"):
-        device = torch.device("cuda:0")
-        device_id = 0
-    else:
-        device = torch.device(args.device)
-        device_id = 0
-    print(f"Device: {device}, {torch.cuda.is_available()} Device ID: {device_id}")
-
+def run_worker(rank, world_size, args):
+    """Worker function that runs on each GPU process"""
+    # Setup distributed training for this rank
+    setup_distributed(rank, world_size, args.master_addr, args.master_port, args.num_nodes, args.node_rank)
+    
+    # Calculate actual local rank and device for multi-node setup
+    local_world_size = world_size // args.num_nodes
+    local_rank = rank
+    global_rank = args.node_rank * local_world_size + rank
+    
+    # Set device for this rank
+    device = torch.device(f"cuda:{local_rank}")
+    device_id = local_rank
+    
+    # Load data (each rank loads the same data but will get different subsets via DistributedSampler)
     (feature_store, dist_edge_index), split_idx, num_features, num_classes = load_data(
         args.dataset, args.data_root, device, device_id
     )
@@ -211,27 +286,99 @@ def main():
         graph_indices=test_graph_indices
     )
     
-    # Create DataLoaders for graph-level batching
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    # Create distributed samplers to split data across ranks
+    train_sampler = DistributedSampler(
+        train_dataset, 
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True
+    )
+    
+    test_sampler = DistributedSampler(
+        test_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+    
+    # Create DataLoaders with distributed samplers
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        sampler=train_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size, 
+        sampler=test_sampler,
+        num_workers=2,
+        pin_memory=True
+    )
 
+    # Create model and wrap with DistributedDataParallel
     model = GIN(num_features, args.hidden_dim, num_classes, args.num_layers).to(device)
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
+    # Training loop
     times = []
     for epoch in range(1, args.epochs + 1):
+        # Set epoch for DistributedSampler to ensure different shuffling across epochs
+        train_sampler.set_epoch(epoch)
+        
         start = time.time()
-        loss = train(model, train_loader, optimizer, device)
-        train_acc = test(model, train_loader, device)
-        test_acc = test(model, test_loader, device)
+        loss = train(model, train_loader, optimizer, device, local_rank, global_rank)
+        train_acc = test(model, train_loader, device, local_rank, global_rank)
+        test_acc = test(model, test_loader, device, local_rank, global_rank)
         times.append(time.time() - start)
-        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, Train: {train_acc:.4f}, '
-              f'Test: {test_acc:.4f}')
+        
+        # Synchronize all processes before printing
+        dist.barrier()
+        
+        # Only global rank 0 prints to avoid duplicate outputs
+        if global_rank == 0:
+            print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, Train: {train_acc:.4f}, '
+                  f'Test: {test_acc:.4f}')
+        
+        # Synchronize again after printing
+        dist.barrier()
     
-    print(f'Median time per epoch: {torch.tensor(times).median():.4f}s')
+    if global_rank == 0:
+        print(f'Median time per epoch: {torch.tensor(times).median():.4f}s')
+    
+    # Cleanup
+    dist.destroy_process_group()
+
+def main():
+    args = parse_args()
+    
+    # Determine local world size (GPUs per node)
+    local_world_size = torch.cuda.device_count()
+    if local_world_size == 0:
+        raise RuntimeError("No CUDA devices available for distributed training")
+    
+    # Calculate total world size
+    if args.world_size is None:
+        world_size = local_world_size * args.num_nodes
+    else:
+        world_size = args.world_size
+    
+    print(f"Starting distributed training:")
+    print(f"  Total nodes: {args.num_nodes}")
+    print(f"  Node rank: {args.node_rank}")
+    print(f"  GPUs per node: {local_world_size}")
+    print(f"  Total processes: {world_size}")
+    
+    # Use torch.multiprocessing to spawn multiple processes (one per local GPU)
+    mp.spawn(
+        run_worker,
+        args=(world_size, args),
+        nprocs=local_world_size,  # Only spawn processes for local GPUs
+        join=True
+    )
 
 if __name__ == '__main__':
-    main()
-
-if dist.is_initialized():
-    dist.destroy_process_group() 
+    main() 
